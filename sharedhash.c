@@ -55,7 +55,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <semaphore.h>
-
+#include <pthread.h>
 #define BLOCK_SIZE 1024
 #define SYMBOLS 256
 #define LARGE_PRIME 2147483647
@@ -66,6 +66,7 @@ void ufree(void *ptr);
 unsigned long process_block(const unsigned char *buf, size_t len);
 int run_single(const char *filename);
 int run_multi(const char *filename);
+int run_threads(const char *filename);
 
 /* =======================================================================
    PROVIDED CODE — DO NOT MODIFY
@@ -95,7 +96,7 @@ typedef struct __node_t {
  * multiple children try to allocate/free simultaneously.
  */
 
-static node_t **free_list_ptr = NULL;
+static node_t *free_list_ptr = NULL;
 
 #define ALIGNMENT 16
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
@@ -111,8 +112,10 @@ static node_t **free_list_ptr = NULL;
  * This avoids locking overhead when running single-threaded.
  */
 
-sem_t* mLock;
+pthread_mutex_t mLock = PTHREAD_MUTEX_INITIALIZER;
 int use_multiprocess = 0;
+int use_multithread = 0;
+
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -127,37 +130,16 @@ int use_multiprocess = 0;
  * region.
  */
 
+
 void *init_umem(void) {
-    free_list_ptr = mmap(NULL, sizeof(node_t *),
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (free_list_ptr == MAP_FAILED) {
-        perror("mmap free_list_ptr");
+    void *base = malloc(UMEM_SIZE);
+    if (!base) {
+        perror("malloc");
         exit(1);
     }
-
-    if (use_multiprocess) {
-        mLock = mmap(NULL, sizeof(sem_t),
-                     PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-        if (mLock == MAP_FAILED) {
-            perror("mmap semaphore");
-            exit(1);
-        }
-        sem_init(mLock, 1, 1);  // pshared=1: shared between processes
-    }
-
-    void *base = mmap(NULL, UMEM_SIZE,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
-
-    *free_list_ptr = (node_t *)base;
-    (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
-    (*free_list_ptr)->next = NULL;
+    free_list_ptr = (node_t *)base;
+    free_list_ptr->size = UMEM_SIZE - sizeof(node_t);
+    free_list_ptr->next = NULL;
     return base;
 }
 
@@ -177,7 +159,7 @@ void *init_umem(void) {
  */
 
 static void coalesce(void) {
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list_ptr;
     while (curr && curr->next) {
         char *end = (char *)curr + sizeof(node_t) + ALIGN(curr->size);
         if (end == (char *)curr->next) {
@@ -215,7 +197,7 @@ void *_umalloc(size_t size) {
 
     size = ALIGN(size);
     node_t *prev = NULL;
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list_ptr;
 
     while (curr) {
         if (curr->size >= (long)size) {
@@ -235,12 +217,12 @@ void *_umalloc(size_t size) {
                 if (prev)
                     prev->next = new_free;
                 else
-                    *free_list_ptr = new_free;
+                    free_list_ptr = new_free;
             } else {
                 if (prev)
                     prev->next = next_free;
                 else
-                    *free_list_ptr = next_free;
+                    free_list_ptr = next_free;
             }
 
             return user_ptr;
@@ -280,11 +262,11 @@ void _ufree(void *ptr) {
     node->size = ALIGN(hdr->size);
     node->next = NULL;
 
-    if (!*free_list_ptr || node < *free_list_ptr) {
-        node->next = *free_list_ptr;
-        *free_list_ptr = node;
+    if (!free_list_ptr || node < free_list_ptr) {
+        node->next = free_list_ptr;
+        free_list_ptr = node;
     } else {
-        node_t *curr = *free_list_ptr;
+        node_t *curr = free_list_ptr;
         while (curr->next && curr->next < node)
             curr = curr->next;
         node->next = curr->next;
@@ -313,16 +295,16 @@ void _ufree(void *ptr) {
  */
 
 void *umalloc(size_t size) {
-    if (use_multiprocess) sem_wait(mLock);
+    if (use_multithread) pthread_mutex_lock(&mLock);
     void* p = _umalloc(size);
-    if (use_multiprocess) sem_post(mLock);
+    if (use_multithread) pthread_mutex_unlock(&mLock);
     return p;
 }
 
 void ufree(void *ptr) {
-    if (use_multiprocess) sem_wait(mLock);
+    if (use_multithread) pthread_mutex_lock(&mLock);
     _ufree(ptr);
-    if (use_multiprocess) sem_post(mLock);
+    if (use_multithread) pthread_mutex_unlock(&mLock);
 }
 
 /* =======================================================================
@@ -464,16 +446,19 @@ void print_final(unsigned long final_hash) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <file> [-m]\n", argv[0]);
+        fprintf(stderr, "Usage: %s  [-m|-t]\n", argv[0]);
         return 1;
     }
 
     const char *filename = argv[1];
     use_multiprocess = (argc >= 3 && strcmp(argv[2], "-m") == 0);
+    use_multithread = (argc >= 3 && strcmp(argv[2], "-t") == 0);
 
     init_umem();
 
-    if (use_multiprocess)
+    if (use_multithread)
+        return run_threads(filename);
+    else if (use_multiprocess)
         return run_multi(filename);
     else
         return run_single(filename);
@@ -574,6 +559,7 @@ int run_single(const char *filename) {
  * 10 children and ~500 allocations each, most processes are blocked most
  * of the time. This is why students will optimize the allocator in Part 2.
  */
+
 
 int run_multi(const char *filename) {
     FILE *fp = fopen(filename, "rb");
@@ -686,6 +672,123 @@ int run_multi(const char *filename) {
     for (int i = 0; i < num_blocks; i++)
         waitpid(pids[i], NULL, 0);
 
+    print_final(final_hash);
+    return 0;
+}
+
+
+
+
+// Thread argument structure
+typedef struct {
+    int block_id;
+    unsigned char *block_buf;
+    size_t block_len;
+    unsigned long *results;
+} thread_arg_t;
+
+// Worker thread function
+void *worker_thread(void *arg) {
+    thread_arg_t *targ = (thread_arg_t *)arg;
+    unsigned long h = process_block(targ->block_buf, targ->block_len);
+    ufree(targ->block_buf);
+    targ->results[targ->block_id] = h;
+    return NULL;
+}
+
+
+int run_threads(const char *filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("fopen");
+        return 1;
+    }
+
+    unsigned char buf[BLOCK_SIZE];
+    unsigned long final_hash = 0;
+    
+    pthread_t threads[1024];
+    thread_arg_t thread_args[1024];
+    unsigned long results_array[1024];
+
+    int num_blocks = 0;
+    
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     * Phase 1: Fork all children (parallel execution)
+     */
+
+    while (!feof(fp)) {
+        size_t n = fread(buf, 1, BLOCK_SIZE, fp);
+        if (n == 0) break;
+
+        if (num_blocks >= 1024) {
+            fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
+            fclose(fp);
+            return 1;
+        }
+
+        unsigned char *block_buf = umalloc(n);
+        if (!block_buf) {
+            fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
+            fclose(fp);
+            return 1;
+        }
+        memcpy(block_buf, buf, n);
+
+        // Initialize a new thread at position in thread array        
+        thread_args[num_blocks].block_id = num_blocks;
+        thread_args[num_blocks].block_buf = block_buf;
+        thread_args[num_blocks].block_len = n;
+        thread_args[num_blocks].results = results_array;
+
+        
+        int pid = pthread_create(&threads[num_blocks], NULL, worker_thread, 
+                                 &thread_args[num_blocks]);             
+
+        if (pid != 0) {
+            perror("Thread creation is borked");
+            ufree(block_buf);
+            fclose(fp);
+            return 1;
+        }
+
+        num_blocks++;
+        
+    }
+
+    fclose(fp);
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     * Phase 2: Collect results in order
+     *
+     * Read from pipes sequentially. This determines output order but
+     * doesn't affect parallelism - children are already running. If a
+     * child finished early, read() returns immediately. If still running,
+     * we block until it writes.
+     */
+
+    for (int i = 0; i < num_blocks; i++) {
+
+        pthread_join(threads[i], NULL);
+
+        //print_intermediate(i, h, pids[i]);
+        //final_hash = (final_hash + h) % LARGE_PRIME;
+    }
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     * Phase 3: Wait for all children to complete
+     *
+     * Reap any remaining children to avoid zombies. Most should have
+     * finished during Phase 2 (when we read their results), but waitpid()
+     * ensures clean termination.
+     */
+
+    for (int i = 0; i < num_blocks; i++){
+        unsigned long h = results_array[i];
+        print_intermediate(i, h, threads[i]);
+        final_hash = (final_hash + h) % LARGE_PRIME;
+    }
     print_final(final_hash);
     return 0;
 }
