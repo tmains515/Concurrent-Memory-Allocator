@@ -707,6 +707,7 @@ int run_threads(const char *filename) {
     unsigned char buf[BLOCK_SIZE];
     unsigned long final_hash = 0;
     
+    // Initialize arrays to store threads, args, and resulting hashes.
     pthread_t threads[1024];
     thread_arg_t thread_args[1024];
     unsigned long results_array[1024];
@@ -714,8 +715,9 @@ int run_threads(const char *filename) {
     int num_blocks = 0;
     
 
+
     /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     * Phase 1: Fork all children (parallel execution)
+     * New thread based implementation
      */
 
     while (!feof(fp)) {
@@ -743,8 +745,7 @@ int run_threads(const char *filename) {
         thread_args[num_blocks].results = results_array;
 
         
-        int pid = pthread_create(&threads[num_blocks], NULL, worker_thread, 
-                                 &thread_args[num_blocks]);             
+        int pid = pthread_create(&threads[num_blocks], NULL, worker_thread, &thread_args[num_blocks]);             
 
         if (pid != 0) {
             perror("Thread creation is borked");
@@ -759,31 +760,12 @@ int run_threads(const char *filename) {
 
     fclose(fp);
 
-    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     * Phase 2: Collect results in order
-     *
-     * Read from pipes sequentially. This determines output order but
-     * doesn't affect parallelism - children are already running. If a
-     * child finished early, read() returns immediately. If still running,
-     * we block until it writes.
-     */
-
+    // Wait for completion of all threads
     for (int i = 0; i < num_blocks; i++) {
-
         pthread_join(threads[i], NULL);
-
-        //print_intermediate(i, h, pids[i]);
-        //final_hash = (final_hash + h) % LARGE_PRIME;
     }
 
-    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     * Phase 3: Wait for all children to complete
-     *
-     * Reap any remaining children to avoid zombies. Most should have
-     * finished during Phase 2 (when we read their results), but waitpid()
-     * ensures clean termination.
-     */
-
+    //Accumulate and print final resulting hash
     for (int i = 0; i < num_blocks; i++){
         unsigned long h = results_array[i];
         print_intermediate(i, h, threads[i]);
