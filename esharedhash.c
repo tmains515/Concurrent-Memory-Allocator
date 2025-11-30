@@ -56,6 +56,8 @@
 #include <sys/wait.h>
 #include <semaphore.h>
 #include <pthread.h>
+#include <stdatomic.h>
+
 #define BLOCK_SIZE 1024
 #define SYMBOLS 256
 #define LARGE_PRIME 2147483647
@@ -67,6 +69,8 @@ unsigned long process_block(const unsigned char *buf, size_t len);
 int run_single(const char *filename);
 int run_multi(const char *filename);
 int run_threads(const char *filename);
+void init_size_classes(void *base, size_t total_size);
+atomic_int lock_count = 0;
 
 /* =======================================================================
    PROVIDED CODE — DO NOT MODIFY
@@ -83,6 +87,15 @@ typedef struct __node_t {
     long size;
     struct __node_t *next;
 } node_t;
+
+
+
+#define NUM_CLASSES 16
+pthread_mutex_t locks[NUM_CLASSES];
+node_t *free_lists[NUM_CLASSES];
+
+atomic_int lock_counts[NUM_CLASSES] = {0};
+
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Shared Memory Free List Management
@@ -137,9 +150,15 @@ void *init_umem(void) {
         perror("malloc");
         exit(1);
     }
-    free_list_ptr = (node_t *)base;
-    free_list_ptr->size = UMEM_SIZE - sizeof(node_t);
-    free_list_ptr->next = NULL;
+        
+    if (use_multithread) {
+        init_size_classes(base, UMEM_SIZE); 
+    } else {
+        free_list_ptr = (node_t *)base;
+        free_list_ptr->size = UMEM_SIZE - sizeof(node_t);
+        free_list_ptr->next = NULL;
+    }
+    
     return base;
 }
 
@@ -294,18 +313,154 @@ void _ufree(void *ptr) {
  * per-thread memory pools or lock-free structures in later assignments.
  */
 
+ atomic_int small_alloc_counter = 0;
+// Allocate to the regions based on alloc size, partition each less than 32 to random since bulk of file is 32 byte huffman nodes
+int size_class(size_t size) {
+    if (size <= 32) {
+        return atomic_fetch_add(&small_alloc_counter, 1) % 6;
+    }
+    if (size <= 512) return 8;
+    if (size <= 1024) return 9;
+    return 15;
+}
+
+
+void init_size_classes(void *base, size_t total_size) {
+    // Divide heap into regions
+    size_t chunk = total_size / NUM_CLASSES;
+    
+    for (int i = 0; i < NUM_CLASSES; i++) {
+        node_t *region = (node_t *)((char *)base + i * chunk);
+        region->size = chunk - sizeof(node_t);
+        region->next = NULL;
+        free_lists[i] = region;
+    }
+}
+
+void *_umalloc_class(int class, size_t size) {
+    node_t *prev = NULL;
+    node_t *curr = free_lists[class];
+    
+    while (curr) {
+        if (curr->size >= (long)size) {
+            char *alloc_start = (char *)curr;
+            long remaining = curr->size - (long)size;
+            node_t *next_free = curr->next;
+            
+            header_t *hdr = (header_t *)alloc_start;
+            hdr->size = size;
+            hdr->magic = MAGIC;
+            void *user_ptr = alloc_start + sizeof(header_t);
+            
+            if (remaining > (long)sizeof(node_t)) {
+                node_t *new_free = (node_t *)(alloc_start + sizeof(header_t) + size);
+                new_free->size = remaining - sizeof(node_t);
+                new_free->next = next_free;
+                if (prev)
+                    prev->next = new_free;
+                else
+                    free_lists[class] = new_free;
+            } else {
+                if (prev)
+                    prev->next = next_free;
+                else
+                    free_lists[class] = next_free;
+            }
+            
+            return user_ptr;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    
+    return NULL;
+}
+
+
+
+
 void *umalloc(size_t size) {
-    if (use_multithread) pthread_mutex_lock(&mLock);
-    void* p = _umalloc(size);
-    if (use_multithread) pthread_mutex_unlock(&mLock);
-    return p;
+    if (size == 0) return NULL;
+    size = ALIGN(size);
+        
+    if (!use_multithread) {
+        return _umalloc(size);
+    }
+    int class = size_class(size);
+    atomic_fetch_add(&lock_counts[class], 1);    
+    pthread_mutex_lock(&locks[class]);
+    void *ptr = _umalloc_class(class, size);
+    pthread_mutex_unlock(&locks[class]);
+    
+    if (ptr) return ptr;
+    
+    for (int c = class + 1; c < NUM_CLASSES; c++) {
+        pthread_mutex_lock(&locks[c]);
+        ptr = _umalloc_class(c, size);
+        pthread_mutex_unlock(&locks[c]);
+        if (ptr) return ptr;
+    }
+    
+    return NULL;
+    // if (use_multithread) pthread_mutex_lock(&mLock);
+    // void* p = _umalloc(size);
+    // if (use_multithread) pthread_mutex_unlock(&mLock);
+    // return p;
+}
+
+void _ufree_class(void *ptr, int class) {
+    if (!ptr) return;
+
+    header_t *hdr = (header_t *)((char *)ptr - sizeof(header_t));
+    if (hdr->magic != MAGIC) {
+        fprintf(stderr, "Error: invalid free detected.\n");
+        abort();
+    }
+
+    node_t *node = (node_t *)hdr;
+    node->size = ALIGN(hdr->size);
+    node->next = NULL;
+
+    // Insert into the appropriate size class free list
+    if (!free_lists[class] || node < free_lists[class]) {
+        node->next = free_lists[class];
+        free_lists[class] = node;
+    } else {
+        node_t *curr = free_lists[class];
+        while (curr->next && curr->next < node)
+            curr = curr->next;
+        node->next = curr->next;
+        curr->next = node;
+    }
+    
 }
 
 void ufree(void *ptr) {
-    if (use_multithread) pthread_mutex_lock(&mLock);
-    _ufree(ptr);
-    if (use_multithread) pthread_mutex_unlock(&mLock);
+    if (!ptr) return;
+    
+    if (!use_multithread) {
+        _ufree(ptr);
+        return;
+    }
+    
+    header_t *hdr = (header_t *)((char *)ptr - sizeof(header_t));
+    size_t size = hdr->size;
+    int class = size_class(size);
+    
+    pthread_mutex_lock(&locks[class]);
+    _ufree_class(ptr, class);
+    pthread_mutex_unlock(&locks[class]);
 }
+
+
+
+
+
+
+
+
+
+
 
 /* =======================================================================
    Huffman Tree Construction (Given)
@@ -456,13 +611,19 @@ int main(int argc, char *argv[]) {
 
     init_umem();
 
+    int result;
     if (use_multithread)
-        return run_threads(filename);
+        result = run_threads(filename);
     else if (use_multiprocess)
-        return run_multi(filename);
+        result = run_multi(filename);
     else
-        return run_single(filename);
+        result = run_single(filename);
+
+
+    return result;
 }
+
+
 
 /* `````````````````````````````````````````````````````````````````````
  * Per-Block Processing Logic
@@ -582,11 +743,11 @@ int run_multi(const char *filename) {
         size_t n = fread(buf, 1, BLOCK_SIZE, fp);
         if (n == 0) break;
 
-        // if (num_blocks >= 1024) {
-        //     fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
-        //     fclose(fp);
-        //     return 1;
-        // }
+        if (num_blocks >= 1024) {
+            fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
+            fclose(fp);
+            return 1;
+        }
 
         unsigned char *block_buf = umalloc(n);
         if (!block_buf) {
@@ -704,7 +865,7 @@ int run_threads(const char *filename) {
         return 1;
     }
 
-    // determine array sizes
+    // Get file size to determine array sizes
     fseek(fp, 0, SEEK_END);
     long file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
@@ -737,6 +898,7 @@ int run_threads(const char *filename) {
         if (!block_buf) {
             fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
             fclose(fp);
+
             // Clean up already-created threads
             for (int i = 0; i < num_blocks; i++)
                 pthread_join(threads[i], NULL);
@@ -747,11 +909,13 @@ int run_threads(const char *filename) {
         }
         memcpy(block_buf, buf, n);
 
+        // initialize arguments for this thread
         thread_args[num_blocks].block_id = num_blocks;
         thread_args[num_blocks].block_buf = block_buf;
         thread_args[num_blocks].block_len = n;
         thread_args[num_blocks].results = results_array;
 
+        // start thread
         int rc = pthread_create(&threads[num_blocks], NULL, worker_thread, &thread_args[num_blocks]);
         if (rc != 0) {
             perror("pthread_create");
@@ -770,10 +934,13 @@ int run_threads(const char *filename) {
 
     fclose(fp);
 
+    //Wait for all threads to complete
     for (int i = 0; i < num_blocks; i++) {
         pthread_join(threads[i], NULL);
     }
 
+
+    // print final hash and free memory
     for (int i = 0; i < num_blocks; i++) {
         unsigned long h = results_array[i];
         print_intermediate(i, h, (pid_t)threads[i]);
